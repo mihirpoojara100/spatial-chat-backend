@@ -1,109 +1,217 @@
-from typing import Dict, Any
-from google.cloud import bigquery
-from google.oauth2 import service_account
+# Need to dig deep in geo points and it's tool
+from typing import Dict, Any, TypedDict, Annotated
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-import os
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMessage
+from langgraph.graph.message import add_messages
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
 import json
+import requests
+import polyline
+from geopy.distance import geodesic
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut
+import time
+from app.utils.constants import GOOGLE_API_KEY, GOOGLE_MAPS_API_KEY
 
 
-def bigquery_to_geojson(results) -> Dict[str, Any]:
-    """Convert BigQuery results to GeoJSON FeatureCollection"""
-    features = []
+# Env globals
+geolocator = Nominatim(user_agent="gis_agent")
 
-    for row in results:
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-pro",
+    google_api_key=GOOGLE_API_KEY,
+    temperature=0.7
+)
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    output: Dict[str, Any]
+    project_id: str
+    dataset_id: str
+
+
+@tool
+def get_route_with_pois(route_query: str, poi_type: str = "") -> Dict[str, Any]:
+    """Get route and POIs. Extracts start/end from query (e.g., 'from Point A to B').
+    If poi_type is empty, only the route is returned without searching for POIs."""
+
+    def geocode_city(city: str) -> tuple:
         try:
-            row_dict = dict(row)
+            location = geolocator.geocode(city)
+            time.sleep(1)
+            if location:
+                return (location.latitude, location.longitude)
+        except GeocoderTimedOut:
+            pass
+        return None
 
-            # Extract geometry
-            geometry = None
-            geometry_keys = ['geometry', 'geojson', 'location', 'geo']
+    parts = route_query.lower().split(' to ')
+    if len(parts) >= 2:
+        start_city = parts[0].replace('from ', '').strip()
+        end_city = parts[1].strip()
+        point_a = geocode_city(start_city)
+        point_b = geocode_city(end_city)
+    else:
+        raise ValueError("Could not parse start/end from query")
 
-            for key in geometry_keys:
-                if key in row_dict and row_dict[key]:
-                    geometry_str = row_dict[key]
-                    if isinstance(geometry_str, str):
-                        geometry = json.loads(geometry_str)
-                    else:
-                        geometry = geometry_str
-                    break
+    if not point_a or not point_b:
+        raise ValueError("Geocoding failed for cities")
 
-            if not geometry:
-                continue
+    url = 'https://routes.googleapis.com/directions/v2:computeRoutes'
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': GOOGLE_MAPS_API_KEY,
+        'X-Goog-FieldMask': 'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline'
+    }
+    data = {
+        'origin': {'location': {'latLng': {'latitude': point_a[0], 'longitude': point_a[1]}}},
+        'destination': {'location': {'latLng': {'latitude': point_b[0], 'longitude': point_b[1]}}},
+        'travelMode': 'DRIVE',
+        'routingPreference': 'TRAFFIC_AWARE_OPTIMAL',
+        'polylineQuality': 'HIGH_QUALITY'
+    }
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code != 200:
+        raise ValueError(f"Routes error: {response.text}")
 
-            # Exclude geometry fields from properties
-            properties = {k: v for k, v in row_dict.items()
-                          if k not in geometry_keys and v is not None}
+    result = response.json()
+    encoded_polyline = result['routes'][0]['polyline']['encodedPolyline']
+    route_coords = polyline.decode(encoded_polyline)
+    distance_km = result['routes'][0]['distanceMeters'] / 1000
 
-            feature = {
-                "type": "Feature",
-                "geometry": geometry,
-                "properties": properties
-            }
-            features.append(feature)
-
-        except Exception:
-            continue
+    pois = []
+    if poi_type and poi_type.strip():
+        poi_url = 'https://places.googleapis.com/v1/places:searchText'
+        poi_headers = {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': GOOGLE_MAPS_API_KEY,
+            'X-Goog-FieldMask': 'places.displayName,places.location,places.formattedAddress'
+        }
+        poi_data = {
+            'textQuery': poi_type,
+            'pageSize': 20,
+            'searchAlongRouteParameters': {'polyline': {'encodedPolyline': encoded_polyline}}
+        }
+        poi_response = requests.post(
+            poi_url, headers=poi_headers, json=poi_data)
+        if poi_response.status_code != 200:
+            pois = []
+        else:
+            pois_raw = poi_response.json().get('places', [])
+            pois = []
+            for p in pois_raw:
+                lat = p['location']['latitude']
+                lon = p['location']['longitude']
+                name = p['displayName']['text']
+                address = p.get('formattedAddress', 'N/A')
+                min_dist = min(
+                    geodesic((lat, lon), coord).km for coord in route_coords)
+                pois.append({'name': name, 'lat': lat, 'lon': lon,
+                            'distance_km': min_dist, 'address': address})
+            pois.sort(key=lambda x: x['distance_km'])
 
     return {
-        "type": "FeatureCollection",
-        "features": features
+        "route_data": {
+            "route_coords": route_coords,
+            "pois": pois[:10],
+            "distance_km": distance_km
+        }
     }
 
 
-def get_bigquery_client():
-    """Initialize BigQuery client with credentials"""
-    credentials_path = "credentials.json"
-    if credentials_path and os.path.exists(credentials_path):
-        credentials = service_account.Credentials.from_service_account_file(
-            credentials_path,
-            scopes=["https://www.googleapis.com/auth/bigquery"]
-        )
-        return bigquery.Client(credentials=credentials)
-    return bigquery.Client()
+@tool
+def simple_chat_response(query: str) -> str:
+    """Direct LLM response for general queries."""
+    return llm.invoke([HumanMessage(content=query)]).content
 
 
-def get_llm_chain():
-    """Initialize LangChain with Google Gemini"""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY not found in environment variables")
+def router_node(state: AgentState) -> Dict[str, Any]:
+    router_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Classify and act:
+        - ROUTE: ... → get_route_with_pois.
+        - CHAT: General → simple_chat_response (but agent will finalize).
+        Use tool calls only for ROUTE/QUERY; for CHAT, respond directly with info."""),
+        MessagesPlaceholder(variable_name="messages"),
+    ])
+    chain = router_prompt | llm.bind_tools(
+        [get_route_with_pois, simple_chat_response])
+    user_msg = HumanMessage(content=state["messages"][-1].content if hasattr(
+        state["messages"][-1], 'content') else state["messages"][-1]["content"])
+    response = chain.invoke({"messages": [user_msg]})
+    return {"messages": [response]}
 
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-pro",
-        google_api_key=api_key,
-        temperature=0.7,
-        max_output_tokens=2048
-    )
 
-    prompt_template = """You are an expert SQL generator for Google BigQuery GIS queries.
+def should_continue(state: AgentState) -> str:
+    last_msg = state["messages"][-1]
+    # Guard: Only AIMessages can have tool_calls
+    if not isinstance(last_msg, AIMessage):
+        return END
+    if last_msg.tool_calls:  # Simplified: No hasattr needed if type-checked
+        # Optional: Break if last tool was chat to prevent loops
+        if len(state["messages"]) >= 2 and hasattr(state["messages"][-2], 'tool_calls') and state["messages"][-2].tool_calls:
+            tool_name = state["messages"][-2].tool_calls[0].get('name', '')
+            if tool_name == 'simple_chat_response':
+                return END
+        return "tools"
+    return END
 
-    Convert the following natural language query into a valid BigQuery SQL statement that outputs GeoJSON data.
 
-    REQUIREMENTS:
-    1. Use BigQuery GIS functions (ST_AsGeoJSON, ST_Within, ST_Distance, etc.)
-    2. Always include ST_AsGeoJSON to convert geometry
-    3. Output columns: id, name, properties, geometry
-    4. Use spatial predicates properly
-    5. Ensure results can be converted to GeoJSON FeatureCollection
-    6. Use full table path: `project.dataset.table`
-    7. GEOGRAPHY data type for spatial columns
+def agent_node(state: AgentState) -> Dict[str, Any]:
+    # Check if last was chat tool → Use LLM to generate/summarize and end
+    last_msg = state["messages"][-1]
+    if hasattr(last_msg, 'name') and last_msg.name == 'simple_chat_response':
+        # LLM generate for chat (moved here to avoid nested calls)
+        chat_prompt = ChatPromptTemplate.from_template(
+            "Answer this query based on knowledge: {query}. Be concise.")
+        chat_chain = chat_prompt | llm
+        response = chat_chain.invoke({"query": last_msg.content.split(": ")[
+                                     # Extract query from placeholder
+                                     1] if ": " in last_msg.content else last_msg.content})
+        state["output"] = {"response": response.content}
+        # End with final message
+        return {"messages": [AIMessage(content=response.content)]}
+    else:
+        # Standard ReAct for other tools
+        tools = [get_route_with_pois, simple_chat_response]
+        agent_prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a helpful assistant. After tool use, summarize the result and end—no further tools unless needed."),
+            MessagesPlaceholder(variable_name="messages"),
+        ])
+        chain = agent_prompt | llm.bind_tools(tools)
+        response = chain.invoke(state["messages"])
+        if not hasattr(response, 'tool_calls') or not response.tool_calls:
+            # Set output from tool
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, ToolMessage) and msg.content:
+                    try:
+                        tool_output = json.loads(msg.content)
+                        state["output"] = tool_output
+                        break
+                    except json.JSONDecodeError:
+                        state["output"] = {"response": msg.content}
+                        break
+            if "output" not in state:
+                state["output"] = {"response": response.content}
+        return {"messages": [response]}
 
-    Available tables:
-    - `project.dataset.schools` (id, name, location GEOGRAPHY, type, capacity)
-    - `project.dataset.flood_zones` (id, name, geometry GEOGRAPHY, risk_level, area_sq_km)
-    - `project.dataset.parks` (id, name, geometry GEOGRAPHY, area_sq_km, facilities)
-    - `project.dataset.hospitals` (id, name, location GEOGRAPHY, beds, emergency)
 
-    Natural Language Query: {query}
-    Project ID: {project_id}
-    Dataset ID: {dataset_id}
+def get_router_agent_graph():
+    workflow = StateGraph(AgentState)
+    workflow.add_node("router", router_node)
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", ToolNode(
+        [get_route_with_pois, simple_chat_response]))
 
-    SQL Query:"""
+    workflow.set_entry_point("router")
+    workflow.add_conditional_edges("router", should_continue, {
+                                   "tools": "tools", END: END})  # Already good
+    workflow.add_edge("tools", "agent")
+    # Key fix: Full mapping for agent conditional
+    workflow.add_conditional_edges("agent", should_continue, {
+                                   "tools": "tools", END: END})
 
-    prompt = PromptTemplate(
-        template=prompt_template,
-        input_variables=["query", "project_id", "dataset_id"]
-    )
-
-    return prompt | llm
+    return workflow.compile()
