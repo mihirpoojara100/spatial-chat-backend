@@ -14,7 +14,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 import time
-from app.utils.constants import GOOGLE_API_KEY, GOOGLE_MAPS_API_KEY
+from app.utils.constants import GOOGLE_API_KEY, GOOGLE_MAPS_API_KEY, GOOGLE_DIRECTIONS_API_URL, GOOGLE_POI_API_URL
 
 
 # Env globals
@@ -32,6 +32,44 @@ class AgentState(TypedDict):
     output: Dict[str, Any]
     project_id: str
     dataset_id: str
+
+
+@tool
+def geocode_place(place_name: str) -> Dict[str, Any]:
+    """Geocode a place name to get its location as GeoJSON."""
+    def geocode_city(city: str) -> tuple:
+        try:
+            location = geolocator.geocode(city)
+            time.sleep(1)
+            if location:
+                return (location.latitude, location.longitude), location.address
+        except GeocoderTimedOut:
+            pass
+        return None, None
+
+    point, address = geocode_city(place_name)
+    if not point:
+        raise ValueError(f"Could not geocode '{place_name}'")
+
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [point[1], point[0]]  # [lon, lat]
+                },
+                "properties": {
+                    "type": "location",
+                    "name": place_name,
+                    "address": address or "N/A"
+                }
+            }
+        ]
+    }
+
+    return {"geojson": geojson}
 
 
 @tool
@@ -61,7 +99,6 @@ def get_route_with_pois(route_query: str, poi_type: str = "") -> Dict[str, Any]:
     if not point_a or not point_b:
         raise ValueError("Geocoding failed for cities")
 
-    url = 'https://routes.googleapis.com/directions/v2:computeRoutes'
     headers = {
         'Content-Type': 'application/json',
         'X-Goog-Api-Key': GOOGLE_MAPS_API_KEY,
@@ -74,7 +111,10 @@ def get_route_with_pois(route_query: str, poi_type: str = "") -> Dict[str, Any]:
         'routingPreference': 'TRAFFIC_AWARE_OPTIMAL',
         'polylineQuality': 'HIGH_QUALITY'
     }
-    response = requests.post(url, headers=headers, json=data)
+
+    response = requests.post(GOOGLE_DIRECTIONS_API_URL,
+                             headers=headers, json=data)
+
     if response.status_code != 200:
         raise ValueError(f"Routes error: {response.text}")
 
@@ -85,7 +125,6 @@ def get_route_with_pois(route_query: str, poi_type: str = "") -> Dict[str, Any]:
 
     pois = []
     if poi_type and poi_type.strip():
-        poi_url = 'https://places.googleapis.com/v1/places:searchText'
         poi_headers = {
             'Content-Type': 'application/json',
             'X-Goog-Api-Key': GOOGLE_MAPS_API_KEY,
@@ -97,7 +136,7 @@ def get_route_with_pois(route_query: str, poi_type: str = "") -> Dict[str, Any]:
             'searchAlongRouteParameters': {'polyline': {'encodedPolyline': encoded_polyline}}
         }
         poi_response = requests.post(
-            poi_url, headers=poi_headers, json=poi_data)
+            GOOGLE_POI_API_URL, headers=poi_headers, json=poi_data)
         if poi_response.status_code != 200:
             pois = []
         else:
@@ -114,13 +153,44 @@ def get_route_with_pois(route_query: str, poi_type: str = "") -> Dict[str, Any]:
                             'distance_km': min_dist, 'address': address})
             pois.sort(key=lambda x: x['distance_km'])
 
-    return {
-        "route_data": {
-            "route_coords": route_coords,
-            "pois": pois[:10],
-            "distance_km": distance_km
+    # Convert to GeoJSON
+    route_features = [
+        {
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [[lon, lat] for lat, lon in route_coords]
+            },
+            "properties": {
+                "type": "route",
+                "distance_km": distance_km
+            }
         }
+    ]
+
+    poi_features = [
+        {
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [poi["lon"], poi["lat"]]
+            },
+            "properties": {
+                "type": "poi",
+                "name": poi["name"],
+                "distance_km": poi["distance_km"],
+                "address": poi["address"]
+            }
+        }
+        for poi in pois[:10]
+    ]
+
+    geojson = {
+        "type": "FeatureCollection",
+        "features": route_features + poi_features
     }
+
+    return {"geojson": geojson}
 
 
 @tool
@@ -132,13 +202,14 @@ def simple_chat_response(query: str) -> str:
 def router_node(state: AgentState) -> Dict[str, Any]:
     router_prompt = ChatPromptTemplate.from_messages([
         ("system", """Classify and act:
-        - ROUTE: ... → get_route_with_pois.
-        - CHAT: General → simple_chat_response (but agent will finalize).
-        Use tool calls only for ROUTE/QUERY; for CHAT, respond directly with info."""),
+        - LOCATION: Queries like "where is X situated?", "location of X", "find X on map" → geocode_place(place_name="X"). Extract the place name accurately.
+        - ROUTE: Queries like "from A to B", "route from A to B", "POIs like Y between A and B" → get_route_with_pois(route_query="from A to B", poi_type="Y" if specified, else empty).
+        - CHAT: All other general queries → simple_chat_response(query=full user query).
+        Always call the appropriate tool; extract parameters precisely."""),
         MessagesPlaceholder(variable_name="messages"),
     ])
     chain = router_prompt | llm.bind_tools(
-        [get_route_with_pois, simple_chat_response])
+        [geocode_place, get_route_with_pois, simple_chat_response])
     user_msg = HumanMessage(content=state["messages"][-1].content if hasattr(
         state["messages"][-1], 'content') else state["messages"][-1]["content"])
     response = chain.invoke({"messages": [user_msg]})
@@ -171,31 +242,43 @@ def agent_node(state: AgentState) -> Dict[str, Any]:
         response = chat_chain.invoke({"query": last_msg.content.split(": ")[
                                      # Extract query from placeholder
                                      1] if ": " in last_msg.content else last_msg.content})
-        state["output"] = {"response": response.content}
+        state["output"] = {"summary": response.content}
         # End with final message
         return {"messages": [AIMessage(content=response.content)]}
     else:
-        # Standard ReAct for other tools
-        tools = [get_route_with_pois, simple_chat_response]
+        # Standard ReAct for other tools (location/route)
+        tools = [geocode_place, get_route_with_pois, simple_chat_response]
         agent_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful assistant. After tool use, summarize the result and end—no further tools unless needed."),
+            ("system", """You are a helpful assistant. 
+            After using a location or route tool, summarize the result in natural language: 
+            Describe the place/route/POIs clearly, mention key details like address or distance, 
+            and suggest viewing on the map. End—no further tools unless needed."""),
             MessagesPlaceholder(variable_name="messages"),
         ])
         chain = agent_prompt | llm.bind_tools(tools)
         response = chain.invoke(state["messages"])
         if not hasattr(response, 'tool_calls') or not response.tool_calls:
-            # Set output from tool
+            # Set output from previous tool + LLM summary
+            tool_msg = None
             for msg in reversed(state["messages"]):
                 if isinstance(msg, ToolMessage) and msg.content:
                     try:
                         tool_output = json.loads(msg.content)
-                        state["output"] = tool_output
+                        tool_msg = tool_output
                         break
                     except json.JSONDecodeError:
-                        state["output"] = {"response": msg.content}
+                        tool_msg = {"response": msg.content}
                         break
-            if "output" not in state:
-                state["output"] = {"response": response.content}
+            if tool_msg:
+                if "geojson" in tool_msg:
+                    state["output"] = {
+                        "summary": response.content,
+                        "geojson": tool_msg["geojson"]
+                    }
+                else:
+                    state["output"] = {"summary": response.content}
+            else:
+                state["output"] = {"summary": response.content}
         return {"messages": [response]}
 
 
@@ -204,7 +287,7 @@ def get_router_agent_graph():
     workflow.add_node("router", router_node)
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", ToolNode(
-        [get_route_with_pois, simple_chat_response]))
+        [geocode_place, get_route_with_pois, simple_chat_response]))
 
     workflow.set_entry_point("router")
     workflow.add_conditional_edges("router", should_continue, {
